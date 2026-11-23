@@ -1,6 +1,7 @@
 SERVER_BB_M72/
 *.7z
 *.tar.gz
+*.gz
 server.log
 cloudflared
 start.sh
