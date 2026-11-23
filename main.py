@@ -2,9 +2,11 @@
 """BangBang M72 cloud bootstrapper for Altare / GitHub deploys."""
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -18,6 +20,7 @@ ROOT = Path(__file__).resolve().parent
 SERVER_DIR = ROOT / "SERVER_BB_M72"
 APP_PY = SERVER_DIR / "server" / "app.py"
 BRIDGE_PY = SERVER_DIR / "server" / "html5_bridge.py"
+ERLANG_PY = SERVER_DIR / "server" / "erlang_actions.py"
 HTML5_DIR = SERVER_DIR / "www" / "html5"
 
 
@@ -242,30 +245,7 @@ def _revert_perf_patches() -> None:
                 1,
             )
             APP_PY.write_text(txt, encoding="utf-8")
-            print("[revert] Da khoi phuc app.py ve ban goc", flush=True)
-
-    if BRIDGE_PY.is_file():
-        btxt = BRIDGE_PY.read_text(encoding="utf-8")
-        nodelay_block = (
-            "    handler.connection.settimeout(CLIENT_IDLE_TIMEOUT)\n"
-            "    try:\n"
-            "        handler.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)\n"
-            "    except OSError:\n"
-            "        pass"
-        )
-        if nodelay_block in btxt:
-            BRIDGE_PY.write_text(btxt.replace(nodelay_block, "    handler.connection.settimeout(CLIENT_IDLE_TIMEOUT)", 1), encoding="utf-8")
-            print("[revert] Da go TCP_NODELAY tren html5_bridge.py", flush=True)
-
-    www_dir = SERVER_DIR / "www"
-    if www_dir.is_dir():
-        removed_gz = 0
-        for ext in ("*.gz", "*.gz.tmp"):
-            for gz in www_dir.rglob(ext):
-                gz.unlink(missing_ok=True)
-                removed_gz += 1
-        if removed_gz:
-            print(f"[revert] Da xoa {removed_gz} file .gz", flush=True)
+            print("[revert] Da go ban V1 cu cua app.py", flush=True)
 
     if HTML5_DIR.is_dir():
         reverted_js = 0
@@ -286,7 +266,260 @@ def _revert_perf_patches() -> None:
                 js_file.write_text(updated, encoding="utf-8")
                 reverted_js += 1
         if reverted_js:
-            print(f"[revert] Da khoi phuc {reverted_js} file JS ve no-store", flush=True)
+            print(f"[revert] Da khoi phuc {reverted_js} file JS ve ban goc", flush=True)
+
+
+def _patch_safe_performance() -> None:
+    if APP_PY.is_file():
+        txt = APP_PY.read_text(encoding="utf-8")
+        if "# BB_SAFE_PERF_V2" not in txt:
+            old_imports = "import os\nimport json\nimport logging\nimport sys\nimport threading\nimport time"
+            new_imports = "import gzip\nimport os\nimport json\nimport logging\nimport shutil\nimport sys\nimport threading\nimport time"
+            if "import shutil" not in txt and old_imports in txt:
+                txt = txt.replace(old_imports, new_imports, 1)
+
+            old_handler_head = (
+                "class Handler(SimpleHTTPRequestHandler):\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        super().__init__(*args, directory=str(WWW), **kwargs)\n"
+                "\n"
+                "    def end_headers(self) -> None:\n"
+                "        path = urlparse(getattr(self, 'path', '')).path\n"
+                "        import admin_buff\n"
+                "        if admin_buff.page_path(path):\n"
+                "            self.send_header('Cache-Control', 'no-store')\n"
+                "            self.send_header('X-Content-Type-Options', 'nosniff')\n"
+                "            self.send_header('Referrer-Policy', 'no-referrer')\n"
+                "            self.send_header('X-Frame-Options', 'DENY')\n"
+                "            self.send_header('Content-Security-Policy', \"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'\")\n"
+                "        super().end_headers()\n"
+                "\n"
+                "    def do_HEAD(self) -> None:\n"
+                "        path = urlparse(self.path).path\n"
+                "        import admin_buff\n"
+                "        if path.startswith('/api/admin/'):\n"
+                "            return admin_buff.handle(self)\n"
+                "        if admin_buff.page_path(path):\n"
+                "            if not admin_buff.protect_page(self):\n"
+                "                return\n"
+                "        super().do_HEAD()"
+            )
+
+            new_handler_head = (
+                "# BB_SAFE_PERF_V2\n"
+                "class Handler(SimpleHTTPRequestHandler):\n"
+                "    _GZIP_EXTS = frozenset(('.json', '.js', '.css', '.xml'))\n"
+                "    _MEDIA_CACHE_EXTS = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.mp3', '.ogg', '.wav')\n"
+                "\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        super().__init__(*args, directory=str(WWW), **kwargs)\n"
+                "\n"
+                "    def end_headers(self) -> None:\n"
+                "        path = urlparse(getattr(self, 'path', '')).path\n"
+                "        import admin_buff\n"
+                "        if admin_buff.page_path(path):\n"
+                "            self.send_header('Cache-Control', 'no-store')\n"
+                "            self.send_header('X-Content-Type-Options', 'nosniff')\n"
+                "            self.send_header('Referrer-Policy', 'no-referrer')\n"
+                "            self.send_header('X-Frame-Options', 'DENY')\n"
+                "            self.send_header('Content-Security-Policy', \"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'\")\n"
+                "        elif not path.startswith(('/api/', '/admin/', '/capi')) and path.lower().endswith(self._MEDIA_CACHE_EXTS):\n"
+                "            self.send_header('Cache-Control', 'public, max-age=604800, immutable')\n"
+                "        super().end_headers()\n"
+                "\n"
+                "    def _serve_gzip(self, send_body: bool = True) -> bool:\n"
+                "        path = urlparse(self.path).path\n"
+                "        if 'gzip' not in (self.headers.get('Accept-Encoding') or '').lower():\n"
+                "            return False\n"
+                "        if path in ('/', '/index.html') or path.endswith('/'):\n"
+                "            return False\n"
+                "        try:\n"
+                "            www_root = WWW.resolve()\n"
+                "            file_path = (WWW / path.lstrip('/')).resolve()\n"
+                "            if not file_path.is_relative_to(www_root):\n"
+                "                return False\n"
+                "        except (OSError, ValueError):\n"
+                "            return False\n"
+                "        if not file_path.is_file() or file_path.suffix.lower() not in self._GZIP_EXTS:\n"
+                "            return False\n"
+                "        st = file_path.stat()\n"
+                "        if st.st_size <= 1024:\n"
+                "            return False\n"
+                "        gz_path = file_path.with_name(file_path.name + '.gz')\n"
+                "        if gz_path.is_symlink():\n"
+                "            return False\n"
+                "        if not gz_path.is_file() or gz_path.stat().st_mtime < st.st_mtime:\n"
+                "            tmp = file_path.with_name(f'{file_path.name}.{os.getpid()}.{threading.get_ident()}.gz.tmp')\n"
+                "            with file_path.open('rb') as src, gzip.open(tmp, 'wb', compresslevel=6) as dst:\n"
+                "                shutil.copyfileobj(src, dst)\n"
+                "            os.replace(tmp, gz_path)\n"
+                "        gz_size = gz_path.stat().st_size\n"
+                "        self.send_response(200)\n"
+                "        self.send_header('Content-Type', self.guess_type(str(file_path)))\n"
+                "        self.send_header('Content-Encoding', 'gzip')\n"
+                "        self.send_header('Vary', 'Accept-Encoding')\n"
+                "        self.send_header('Content-Length', str(gz_size))\n"
+                "        self.end_headers()\n"
+                "        if send_body:\n"
+                "            try:\n"
+                "                with gz_path.open('rb') as gf:\n"
+                "                    shutil.copyfileobj(gf, self.wfile)\n"
+                "            except (BrokenPipeError, ConnectionResetError):\n"
+                "                pass\n"
+                "        return True\n"
+                "\n"
+                "    def do_HEAD(self) -> None:\n"
+                "        path = urlparse(self.path).path\n"
+                "        import admin_buff\n"
+                "        if path.startswith('/api/admin/'):\n"
+                "            return admin_buff.handle(self)\n"
+                "        if admin_buff.page_path(path):\n"
+                "            if not admin_buff.protect_page(self):\n"
+                "                return\n"
+                "        if self._serve_gzip(send_body=False):\n"
+                "            return\n"
+                "        try:\n"
+                "            super().do_HEAD()\n"
+                "        except (BrokenPipeError, ConnectionResetError):\n"
+                "            pass"
+            )
+            assert old_handler_head in txt, "Handler head not found in app.py"
+            txt = txt.replace(old_handler_head, new_handler_head, 1)
+
+            old_get_tail = "\n        return super().do_GET()\n"
+            new_get_tail = (
+                "\n        if self._serve_gzip(send_body=True):\n"
+                "            return\n"
+                "        try:\n"
+                "            return super().do_GET()\n"
+                "        except (BrokenPipeError, ConnectionResetError):\n"
+                "            return\n"
+            )
+            assert old_get_tail in txt, "do_GET tail not found in app.py"
+            txt = txt.replace(old_get_tail, new_get_tail, 1)
+
+            old_server = (
+                "class Server(ThreadingHTTPServer):\n"
+                "    def handle_error(self, request, client_address):\n"
+                "        log.exception('[http] Request failed from %s', client_address)"
+            )
+            new_server = (
+                "class Server(ThreadingHTTPServer):\n"
+                "    request_queue_size = 128\n"
+                "    daemon_threads = True\n"
+                "\n"
+                "    def handle_error(self, request, client_address):\n"
+                "        exc = sys.exc_info()[1]\n"
+                "        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):\n"
+                "            return\n"
+                "        log.exception('[http] Request failed from %s', client_address)"
+            )
+            assert old_server in txt, "Server block not found in app.py"
+            txt = txt.replace(old_server, new_server, 1)
+
+            APP_PY.write_text(txt, encoding="utf-8")
+            print("[patch] Da bat Gzip + Cache media + TCP backlog trong app.py (giu HTTP/1.0)", flush=True)
+
+    if BRIDGE_PY.is_file():
+        btxt = BRIDGE_PY.read_text(encoding="utf-8")
+        anchor = "    handler.connection.settimeout(CLIENT_IDLE_TIMEOUT)"
+        nodelay = (
+            "    handler.connection.settimeout(CLIENT_IDLE_TIMEOUT)\n"
+            "    try:\n"
+            "        handler.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)\n"
+            "    except OSError:\n"
+            "        pass"
+        )
+        if "handler.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)" not in btxt and anchor in btxt:
+            BRIDGE_PY.write_text(btxt.replace(anchor, nodelay, 1), encoding="utf-8")
+            print("[patch] Da bat TCP_NODELAY tren WebSocket", flush=True)
+
+    if HTML5_DIR.is_dir():
+        count = 0
+        for json_file in sorted(HTML5_DIR.glob("*.json")):
+            st = json_file.stat()
+            if st.st_size <= 1024 * 1024:
+                continue
+            gz_file = json_file.with_name(json_file.name + ".gz")
+            if gz_file.is_file() and gz_file.stat().st_mtime >= st.st_mtime:
+                continue
+            tmp = json_file.with_name(f"{json_file.name}.gz.tmp")
+            with json_file.open("rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
+                shutil.copyfileobj(src, dst)
+            os.replace(tmp, gz_file)
+            count += 1
+        if count:
+            print(f"[setup] Da nen san {count} file JSON lon", flush=True)
+
+
+def _patch_erlang_e() -> None:
+    if not ERLANG_PY.is_file():
+        return
+    txt = ERLANG_PY.read_text(encoding="utf-8")
+    if "# BB_ERLANG_E_FIXED_V1" in txt:
+        return
+
+    # Normalize CRLF so string matches work cleanly on Linux
+    txt = txt.replace("\r\n", "\n")
+
+    old_update = (
+        "        if self.dog and (not self.alive or now>=self.dog['finish'] or not any(\n"
+        "                callback.__self__ is self and callback.__name__=='_event' and args[0]=='flight' and args[1][0] is self.dog\n"
+        "                for _,_,callback,args in self.arena.pending)):\n"
+        "            packets.extend(self._drop_dog(now))"
+    )
+    new_update = (
+        "        # BB_ERLANG_E_FIXED_V1\n"
+        "        if self.dog and not (self.ready and self.ready.get('slot')==1) and (\n"
+        "                not self.alive or not self.has_buff(361201,now) or now>=self.dog['begin']+2000):\n"
+        "            packets.extend(self._drop_dog(now))"
+    )
+    assert old_update in txt, "Erlang update() dog block not found"
+    txt = txt.replace(old_update, new_update, 1)
+
+    old_flight = (
+        "        packets=piercing_step(self,flight,now,self._bullet_hit,pierce=flight['template']!=361100)\n"
+        "        if flight['template']==361501 and (now>=flight['finish'] or not any(\n"
+        "                callback.__self__ is self and callback.__name__=='_event' and args[0]=='flight' and args[1][0] is flight\n"
+        "                for _,_,callback,args in self.arena.pending)):\n"
+        "            packets.extend(self._drop_dog(now))\n"
+        "        return packets"
+    )
+    new_flight = (
+        "        return piercing_step(self,flight,now,self._bullet_hit,pierce=flight['template']!=361100)"
+    )
+    assert old_flight in txt, "Erlang _flight() block not found"
+    txt = txt.replace(old_flight, new_flight, 1)
+
+    old_ready = (
+        "            if cast['slot']==1:\n"
+        "                dog=cast['dog']\n"
+        "                if self.dog is not dog or now>=dog['finish']:return []\n"
+        "                pos=point_at(dog['start'],dog['end'],(now-dog['begin'])/(dog['finish']-dog['begin']))"
+    )
+    new_ready = (
+        "            if cast['slot']==1:\n"
+        "                dog=cast['dog']\n"
+        "                if not dog:return []\n"
+        "                self.dog=None\n"
+        "                ratio=min(1.0,max(0.0,(now-dog['begin'])/max(1,dog['finish']-dog['begin'])))\n"
+        "                pos=point_at(dog['start'],dog['end'],ratio)"
+    )
+    assert old_ready in txt, "Erlang erlang_ready slot 1 block not found"
+    txt = txt.replace(old_ready, new_ready, 1)
+
+    old_same_dest = "        if slot in (0,1,2) and not second and start==dest:return []"
+    new_same_dest = (
+        "        if slot==1 and not second and start==dest:\n"
+        "            dest=(start[0]+60,start[1])\n"
+        "        elif slot in (0,2) and start==dest:\n"
+        "            return []"
+    )
+    assert old_same_dest in txt, "Erlang start==dest guard not found"
+    txt = txt.replace(old_same_dest, new_same_dest, 1)
+
+    ERLANG_PY.write_text(txt, encoding="utf-8")
+    print("[patch] Da sua chieu E Duong Tien (giu cua so 2s, sua race 50ms, cho ban tai cho)", flush=True)
 
 
 def _maybe_start_cloudflared(port: str) -> None:
@@ -311,6 +544,8 @@ def main() -> None:
     _bootstrap_game_files()
     _revert_perf_patches()
     _patch_html5_bridge_for_proxy()
+    _patch_safe_performance()
+    _patch_erlang_e()
 
     key_file = SERVER_DIR / "data" / "admin_buff.key"
     if key_file.is_file():
