@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -16,6 +17,7 @@ TAG = os.environ.get("BB_RELEASE_TAG", "v1.0")
 ROOT = Path(__file__).resolve().parent
 SERVER_DIR = ROOT / "SERVER_BB_M72"
 APP_PY = SERVER_DIR / "server" / "app.py"
+BRIDGE_PY = SERVER_DIR / "server" / "html5_bridge.py"
 
 
 class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -132,6 +134,48 @@ def _bootstrap_game_files() -> None:
         sys.exit(1)
 
 
+def _patch_html5_bridge_for_proxy() -> None:
+    if not BRIDGE_PY.is_file():
+        return
+    txt = BRIDGE_PY.read_text(encoding="utf-8")
+    if 'os.environ.get("BB_PUBLIC_WS") == "1"' in txt:
+        return
+    new_fn = '''def _same_origin(handler):
+    import os
+    origin = handler.headers.get("Origin")
+    if not origin:
+        return False
+    try:
+        parsed = urlsplit(origin)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return False
+        if parsed.username is not None or parsed.path.rstrip("/") or parsed.query or parsed.fragment:
+            return False
+        if os.environ.get("BB_PUBLIC_WS") == "1":
+            fetch_site = (handler.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            return fetch_site in ("", "same-origin", "none")
+        host = handler.headers.get("Host", "").strip()
+        if not host:
+            return False
+        forwarded_host = (handler.headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
+        forwarded_proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        is_tls = isinstance(handler.connection, ssl.SSLSocket)
+        scheme = "https" if (is_tls or forwarded_proto in ("https", "wss")) else "http"
+        netloc = parsed.netloc.lower()
+        return (parsed.scheme == scheme and netloc == host.lower()) or (
+            bool(forwarded_host) and parsed.scheme == scheme and netloc == forwarded_host.lower()
+        )
+    except ValueError:
+        return False
+
+
+'''
+    pattern = re.compile(r"def _same_origin\(handler\):.*?(?=def _requested_role\(path\):)", re.DOTALL)
+    if pattern.search(txt):
+        BRIDGE_PY.write_text(pattern.sub(new_fn, txt, count=1), encoding="utf-8")
+        print("[patch] Da cap nhat kiem tra WebSocket cho proxy Altare", flush=True)
+
+
 def _maybe_start_cloudflared(port: str) -> None:
     if os.environ.get("ENABLE_CLOUDFLARED") != "1":
         return
@@ -149,8 +193,10 @@ def main() -> None:
     os.chdir(ROOT)
     port = (os.environ.get("PORT") or os.environ.get("SERVER_PORT") or "19083").strip()
     os.environ.setdefault("BB_PUBLIC_ADMIN", "1")
+    os.environ.setdefault("BB_PUBLIC_WS", "1")
 
     _bootstrap_game_files()
+    _patch_html5_bridge_for_proxy()
 
     key_file = SERVER_DIR / "data" / "admin_buff.key"
     if key_file.is_file():
