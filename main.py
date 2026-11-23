@@ -21,6 +21,10 @@ SERVER_DIR = ROOT / "SERVER_BB_M72"
 APP_PY = SERVER_DIR / "server" / "app.py"
 BRIDGE_PY = SERVER_DIR / "server" / "html5_bridge.py"
 ERLANG_PY = SERVER_DIR / "server" / "erlang_actions.py"
+STORAGE_PY = SERVER_DIR / "server" / "storage.py"
+SIXCUBE_PY = SERVER_DIR / "server" / "sixcube_server.py"
+MP_BATTLE_PY = SERVER_DIR / "server" / "multiplayer_battle.py"
+MP_GATE_PY = SERVER_DIR / "server" / "multiplayer_gate.py"
 HTML5_DIR = SERVER_DIR / "www" / "html5"
 
 
@@ -522,6 +526,270 @@ def _patch_erlang_e() -> None:
     print("[patch] Da sua chieu E Duong Tien (giu cua so 2s, sua race 50ms, cho ban tai cho)", flush=True)
 
 
+
+def _patch_pvp_latency() -> None:
+    patched = []
+
+    if STORAGE_PY.is_file():
+        txt = STORAGE_PY.read_text(encoding="utf-8").replace("\r\n", "\n")
+        if "# BB_PVP_LOWLATENCY_V1" not in txt:
+            old_pragma = "        db.execute('PRAGMA foreign_keys=ON')"
+            new_pragma = (
+                "        # BB_PVP_LOWLATENCY_V1\n"
+                "        db.execute('PRAGMA foreign_keys=ON')\n"
+                "        db.execute('PRAGMA synchronous=NORMAL')\n"
+                "        db.execute('PRAGMA temp_store=MEMORY')\n"
+                "        db.execute('PRAGMA cache_size=-32000')"
+            )
+            assert old_pragma in txt, "storage.py PRAGMA block not found"
+            STORAGE_PY.write_text(txt.replace(old_pragma, new_pragma, 1), encoding="utf-8")
+            patched.append("storage.py")
+
+    if SIXCUBE_PY.is_file():
+        txt = SIXCUBE_PY.read_text(encoding="utf-8").replace("\r\n", "\n")
+        if "# BB_PVP_LOWLATENCY_V1" not in txt:
+            old_var = "    boss_notice_state = None\n\n    def checkpoint():\n        nonlocal saved_arena"
+            new_var = (
+                "    boss_notice_state = None\n"
+                "    last_battle_checkpoint = 0.0\n\n"
+                "    def checkpoint():\n"
+                "        nonlocal saved_arena, last_battle_checkpoint"
+            )
+            assert old_var in txt, "sixcube_server.py checkpoint header not found"
+            txt = txt.replace(old_var, new_var, 1)
+
+            old_cp_end = (
+                "        else:\n"
+                "            ranked_matches.checkpoint(session_state,arena,saved_arena,world_db)\n\n"
+                "    def send_actions(packets):"
+            )
+            new_cp_end = (
+                "        else:\n"
+                "            ranked_matches.checkpoint(session_state,arena,saved_arena,world_db)\n"
+                "        last_battle_checkpoint = time.monotonic()\n\n"
+                "    def battle_checkpoint_due(packets=()):\n"
+                "        battle = session_state.get('battle')\n"
+                "        arena = battle.get('actions') if battle else None\n"
+                "        if arena is None or (arena.pk and arena.pk.get('finished')):\n"
+                "            return True\n"
+                "        if any(mid == 1708 for mid, _ in packets):\n"
+                "            return True\n"
+                "        return (time.monotonic() - last_battle_checkpoint) >= 2.0\n\n"
+                "    def send_actions(packets):"
+            )
+            assert old_cp_end in txt, "sixcube_server.py checkpoint tail not found"
+            txt = txt.replace(old_cp_end, new_cp_end, 1)
+
+            old_tick = (
+                "        battle = session_state[\"battle\"]\n"
+                "        if battle and battle.get(\"entered\") and battle.get(\"actions\"):\n"
+                "            packets = battle[\"actions\"].tick()\n"
+                "            checkpoint()\n"
+                "            send_actions(packets)"
+            )
+            new_tick = (
+                "        # BB_PVP_LOWLATENCY_V1\n"
+                "        battle = session_state[\"battle\"]\n"
+                "        if battle and battle.get(\"entered\") and battle.get(\"actions\"):\n"
+                "            packets = battle[\"actions\"].tick()\n"
+                "            arena_actions = battle[\"actions\"]\n"
+                "            finished_now = bool((arena_actions.pk and arena_actions.pk.get(\"finished\")) or any(m == 1708 for m, _ in packets))\n"
+                "            if finished_now:\n"
+                "                checkpoint()\n"
+                "                send_actions(packets)\n"
+                "            else:\n"
+                "                if packets:\n"
+                "                    send_actions(packets)\n"
+                "                if battle_checkpoint_due(packets):\n"
+                "                    checkpoint()"
+            )
+            assert old_tick in txt, "sixcube_server.py tick_actions block not found"
+            txt = txt.replace(old_tick, new_tick, 1)
+
+            old_handle = (
+                "                        if actions:\n"
+                "                            conn.settimeout(0.02)\n"
+                "                        log.info(f\"[sixcube] {addr} [BATTLE-ENTRY] scene={scene_id} snapshot sent; awaiting client verification\")\n\n"
+                "                    elif mid in (501, 503, 510, 514):\n"
+                "                        # Dispatch only tanks with implemented base mechanics.\n"
+                "                        battle = session_state[\"battle\"]\n"
+                "                        if battle and battle.get(\"entered\") and battle.get(\"actions\"):\n"
+                "                            packets = battle[\"actions\"].handle(mid,payload)\n"
+                "                            checkpoint()\n"
+                "                            send_actions(packets)\n"
+                "                            continue  # Already committed before the combat reply."
+            )
+            new_handle = (
+                "                        if actions:\n"
+                "                            conn.settimeout(0.005)\n"
+                "                        log.info(f\"[sixcube] {addr} [BATTLE-ENTRY] scene={scene_id} snapshot sent; awaiting client verification\")\n\n"
+                "                    elif mid in (501, 503, 510, 514):\n"
+                "                        # Dispatch only tanks with implemented base mechanics.\n"
+                "                        battle = session_state[\"battle\"]\n"
+                "                        if battle and battle.get(\"entered\") and battle.get(\"actions\"):\n"
+                "                            packets = battle[\"actions\"].handle(mid,payload)\n"
+                "                            arena_actions = battle[\"actions\"]\n"
+                "                            finished_now = bool((arena_actions.pk and arena_actions.pk.get(\"finished\")) or any(m == 1708 for m, _ in packets))\n"
+                "                            if finished_now:\n"
+                "                                checkpoint()\n"
+                "                                send_actions(packets)\n"
+                "                            else:\n"
+                "                                if packets:\n"
+                "                                    send_actions(packets)\n"
+                "                                if battle_checkpoint_due(packets):\n"
+                "                                    checkpoint()\n"
+                "                            continue"
+            )
+            assert old_handle in txt, "sixcube_server.py input handle block not found"
+            txt = txt.replace(old_handle, new_handle, 1)
+
+            SIXCUBE_PY.write_text(txt, encoding="utf-8")
+            patched.append("sixcube_server.py")
+
+    if MP_BATTLE_PY.is_file():
+        txt = MP_BATTLE_PY.read_text(encoding="utf-8").replace("\r\n", "\n")
+        if "# BB_PVP_LOWLATENCY_V1" not in txt:
+            old_tick_sec = "TICK_SECONDS = .02"
+            new_tick_sec = "# BB_PVP_LOWLATENCY_V1\nTICK_SECONDS = .008"
+            assert old_tick_sec in txt, "multiplayer_battle.py TICK_SECONDS not found"
+            txt = txt.replace(old_tick_sec, new_tick_sec, 1)
+
+            old_loop = (
+                "                    if command:\n"
+                "                        self._execute(command)\n"
+                "                        command_budget=time.monotonic()+.004\n"
+                "                        for _ in range(31):\n"
+                "                            if time.monotonic() >= command_budget:\n"
+                "                                break\n"
+                "                            try:\n"
+                "                                self._execute(self._commands.get_nowait())\n"
+                "                            except queue.Empty:\n"
+                "                                break\n"
+                "                    now = time.monotonic()\n"
+                "                    if now >= next_tick:\n"
+                "                        dirty=[]\n"
+                "                        for match in tuple(self.matches.values()):\n"
+                "                            try:\n"
+                "                                if self._tick(match,now):dirty.append(match)\n"
+                "                            except Exception as exc:\n"
+                "                                if not match.error:\n"
+                "                                    log.exception('Shared room %s checkpoint/tick failed',match.room_id)\n"
+                "                                match.error = str(exc)\n"
+                "                                self._publish_status(match)\n"
+                "                        if dirty:\n"
+                "                            try:\n"
+                "                                self._persist_many(dirty)\n"
+                "                                for match in dirty:self._publish_committed(match)\n"
+                "                            except Exception as exc:\n"
+                "                                for match in dirty:\n"
+                "                                    if not match.error:log.exception('Shared room batch checkpoint failed')\n"
+                "                                    match.error=str(exc)\n"
+                "                                    self._publish_status(match)"
+            )
+            new_loop = (
+                "                    had_input = bool(command and command[0] == 'handle')\n"
+                "                    if command:\n"
+                "                        self._execute(command)\n"
+                "                        command_budget=time.monotonic()+.004\n"
+                "                        for _ in range(31):\n"
+                "                            if time.monotonic() >= command_budget:\n"
+                "                                break\n"
+                "                            try:\n"
+                "                                next_cmd = self._commands.get_nowait()\n"
+                "                                if next_cmd[0] == 'handle':\n"
+                "                                    had_input = True\n"
+                "                                self._execute(next_cmd)\n"
+                "                            except queue.Empty:\n"
+                "                                break\n"
+                "                    now = time.monotonic()\n"
+                "                    if had_input:\n"
+                "                        next_tick = min(next_tick, now)\n"
+                "                    if now >= next_tick:\n"
+                "                        dirty=[]\n"
+                "                        for match in tuple(self.matches.values()):\n"
+                "                            try:\n"
+                "                                if self._tick(match,now):dirty.append(match)\n"
+                "                            except Exception as exc:\n"
+                "                                if not match.error:\n"
+                "                                    log.exception('Shared room %s checkpoint/tick failed',match.room_id)\n"
+                "                                match.error = str(exc)\n"
+                "                                self._publish_status(match)\n"
+                "                        if dirty:\n"
+                "                            must_persist = [\n"
+                "                                m for m in dirty\n"
+                "                                if m.phase != 'battle'\n"
+                "                                or (m.arena and m.arena.pk and m.arena.pk['finished'] and not m.state['battle'].get('completed_recorded'))\n"
+                "                                or now - getattr(m, '_last_persist', 0.0) >= 2.0\n"
+                "                            ]\n"
+                "                            fast_publish = [m for m in dirty if m not in must_persist]\n"
+                "                            if must_persist:\n"
+                "                                try:\n"
+                "                                    self._persist_many(must_persist)\n"
+                "                                    for match in must_persist:\n"
+                "                                        match._last_persist = now\n"
+                "                                        self._publish_committed(match)\n"
+                "                                except Exception as exc:\n"
+                "                                    for match in must_persist:\n"
+                "                                        if not match.error:log.exception('Shared room batch checkpoint failed')\n"
+                "                                        match.error=str(exc)\n"
+                "                                        self._publish_status(match)\n"
+                "                            for match in fast_publish:\n"
+                "                                try:\n"
+                "                                    self._publish_committed(match)\n"
+                "                                    match.dirty = False\n"
+                "                                except Exception as exc:\n"
+                "                                    if not match.error:log.exception('Shared room publish failed')\n"
+                "                                    match.error=str(exc)\n"
+                "                                    self._publish_status(match)"
+            )
+            assert old_loop in txt, "multiplayer_battle.py _run loop not found"
+            txt = txt.replace(old_loop, new_loop, 1)
+
+            MP_BATTLE_PY.write_text(txt, encoding="utf-8")
+            patched.append("multiplayer_battle.py")
+
+    if MP_GATE_PY.is_file():
+        txt = MP_GATE_PY.read_text(encoding="utf-8").replace("\r\n", "\n")
+        if "# BB_PVP_LOWLATENCY_V1" not in txt:
+            old_reg = "        self.conn.settimeout(.1)\n        self.last_profile = 0"
+            new_reg = "        # BB_PVP_LOWLATENCY_V1\n        self.conn.settimeout(.02)\n        self.last_profile = 0"
+            assert old_reg in txt, "multiplayer_gate.py _register timeout not found"
+            txt = txt.replace(old_reg, new_reg, 1)
+
+            old_start = "        self.started_room = room['room_id']\n        self.conn.settimeout(.02)"
+            new_start = "        self.started_room = room['room_id']\n        self.conn.settimeout(.005)"
+            assert old_start in txt, "multiplayer_gate.py _send_start timeout not found"
+            txt = txt.replace(old_start, new_start, 1)
+
+            old_clear = "        self.selection_key = None\n        self.conn.settimeout(.1)\n        self.checkpoint()"
+            new_clear = "        self.selection_key = None\n        self.conn.settimeout(.02)\n        self.checkpoint()"
+            assert old_clear in txt, "multiplayer_gate.py _clear_local timeout not found"
+            txt = txt.replace(old_clear, new_clear, 1)
+
+            old_in = (
+                "        if mid in INPUT_MESSAGES:\n"
+                "            if self.started_room:\n"
+                "                self.battles.submit_input(self.profile, mid, payload)\n"
+                "                return True"
+            )
+            new_in = (
+                "        if mid in INPUT_MESSAGES:\n"
+                "            if self.started_room:\n"
+                "                self.battles.submit_input(self.profile, mid, payload)\n"
+                "                packets = self.battles.drain_presented(self.profile)\n"
+                "                if packets:\n"
+                "                    self._send(packets)\n"
+                "                return True"
+            )
+            assert old_in in txt, "multiplayer_gate.py input handle not found"
+            txt = txt.replace(old_in, new_in, 1)
+
+            MP_GATE_PY.write_text(txt, encoding="utf-8")
+            patched.append("multiplayer_gate.py")
+
+    if patched:
+        print("[patch] Da toi uu PvP low-latency (SQLite WAL + 125Hz combat tick + instant packet fanout)", flush=True)
+
 def _maybe_start_cloudflared(port: str) -> None:
     if os.environ.get("ENABLE_CLOUDFLARED") != "1":
         return
@@ -546,6 +814,7 @@ def main() -> None:
     _patch_html5_bridge_for_proxy()
     _patch_safe_performance()
     _patch_erlang_e()
+    _patch_pvp_latency()
 
     key_file = SERVER_DIR / "data" / "admin_buff.key"
     if key_file.is_file():
